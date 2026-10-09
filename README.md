@@ -86,7 +86,4 @@ Detailed guides: [deployment](docs/DEPLOYMENT_GUIDE.md) · [system overview](doc
 
 ## Team
 
-Team project for Special Topics: Cloud Computing, M.S. Data Analytics & Visualization, Yeshiva University (Fall 2025).
-
-- **Tapiwa Mutarimanja** — TODO: describe your part (e.g. Lambda processing logic, DynamoDB design, dashboard, evaluation)
-- **Peter Mangoro** — TODO: confirm name and role
+Team project by Tapiwa Mutarimanja and Peter Mangoro for Special Topics: Cloud Computing, M.S. Data Analytics & Visualization, Yeshiva University (Fall 2025).
