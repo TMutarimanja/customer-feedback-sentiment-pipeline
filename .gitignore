@@ -1,0 +1,9 @@
+node_modules/
+.aws-sam/
+.nuxt/
+.output/
+*.zip
+.DS_Store
+.env
+__pycache__/
+samconfig.local.toml

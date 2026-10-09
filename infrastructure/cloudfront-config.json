@@ -1,0 +1,38 @@
+{
+  "CallerReference": "sentiment-analysis-frontend-2025-10-04",
+  "Comment": "CloudFront distribution for Sentiment Analysis Frontend",
+  "DefaultRootObject": "index.html",
+  "Origins": {
+    "Quantity": 1,
+    "Items": [
+      {
+        "Id": "S3-sentiment-analysis-frontend-123456789012",
+        "DomainName": "sentiment-analysis-frontend-123456789012.s3-website-us-east-1.amazonaws.com",
+        "CustomOriginConfig": {
+          "HTTPPort": 80,
+          "HTTPSPort": 443,
+          "OriginProtocolPolicy": "http-only"
+        }
+      }
+    ]
+  },
+  "DefaultCacheBehavior": {
+    "TargetOriginId": "S3-sentiment-analysis-frontend-123456789012",
+    "ViewerProtocolPolicy": "redirect-to-https",
+    "TrustedSigners": {
+      "Enabled": false,
+      "Quantity": 0
+    },
+    "ForwardedValues": {
+      "QueryString": false,
+      "Cookies": {
+        "Forward": "none"
+      }
+    },
+    "MinTTL": 0,
+    "DefaultTTL": 3600,
+    "MaxTTL": 86400
+  },
+  "Enabled": true,
+  "PriceClass": "PriceClass_100"
+}

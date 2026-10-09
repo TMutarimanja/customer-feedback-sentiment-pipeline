@@ -1,0 +1,72 @@
+[
+  {
+    "feedback": "The app is amazing and easy to use!",
+    "rating": 5,
+    "source": "mobile",
+    "timestamp": "2024-01-15T10:30:00Z",
+    "user_id": "user_001"
+  },
+  {
+    "feedback": "I love the new features, great job!",
+    "rating": 5,
+    "source": "web",
+    "timestamp": "2024-01-15T11:15:00Z",
+    "user_id": "user_002"
+  },
+  {
+    "feedback": "The customer service was terrible and unhelpful.",
+    "rating": 1,
+    "source": "support",
+    "timestamp": "2024-01-15T12:00:00Z",
+    "user_id": "user_003"
+  },
+  {
+    "feedback": "This is the worst banking app I've ever used.",
+    "rating": 1,
+    "source": "mobile",
+    "timestamp": "2024-01-15T13:45:00Z",
+    "user_id": "user_004"
+  },
+  {
+    "feedback": "The interface is confusing and hard to navigate.",
+    "rating": 2,
+    "source": "web",
+    "timestamp": "2024-01-15T14:20:00Z",
+    "user_id": "user_005"
+  },
+  {
+    "feedback": "Good app overall, but could be better.",
+    "rating": 3,
+    "source": "mobile",
+    "timestamp": "2024-01-15T15:10:00Z",
+    "user_id": "user_006"
+  },
+  {
+    "feedback": "Excellent service and fast response times.",
+    "rating": 5,
+    "source": "support",
+    "timestamp": "2024-01-15T16:30:00Z",
+    "user_id": "user_007"
+  },
+  {
+    "feedback": "I'm satisfied with the current features.",
+    "rating": 4,
+    "source": "web",
+    "timestamp": "2024-01-15T17:00:00Z",
+    "user_id": "user_008"
+  },
+  {
+    "feedback": "The app crashes frequently and loses my data.",
+    "rating": 1,
+    "source": "mobile",
+    "timestamp": "2024-01-15T18:15:00Z",
+    "user_id": "user_009"
+  },
+  {
+    "feedback": "Great improvements in the latest update!",
+    "rating": 5,
+    "source": "web",
+    "timestamp": "2024-01-15T19:30:00Z",
+    "user_id": "user_010"
+  }
+]

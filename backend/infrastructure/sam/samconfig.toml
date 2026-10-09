@@ -1,0 +1,51 @@
+# SAM configuration file for deployment
+
+version = 0.1
+
+[default]
+[default.deploy]
+[default.deploy.parameters]
+stack_name = "sentiment-analysis-stack-dev"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-123456789012"
+s3_prefix = "sentiment-analysis"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+parameter_overrides = [
+    "Environment=dev",
+    "S3BucketName=customer-feedback-sentiment-analysis",
+    "NotificationEmail=alerts@example.com"
+]
+image_repositories = []
+
+[staging]
+[staging.deploy]
+[staging.deploy.parameters]
+stack_name = "sentiment-analysis-stack-staging"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-123456789012"
+s3_prefix = "sentiment-analysis-staging"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+parameter_overrides = [
+    "Environment=staging",
+    "S3BucketName=customer-feedback-sentiment-analysis",
+    "NotificationEmail=alerts@example.com"
+]
+image_repositories = []
+
+[production]
+[production.deploy]
+[production.deploy.parameters]
+stack_name = "sentiment-analysis-stack-prod"
+s3_bucket = "aws-sam-cli-managed-default-samclisourcebucket-123456789012"
+s3_prefix = "sentiment-analysis-prod"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+parameter_overrides = [
+    "Environment=prod",
+    "S3BucketName=customer-feedback-sentiment-analysis",
+    "NotificationEmail=alerts@example.com"
+]
+image_repositories = []

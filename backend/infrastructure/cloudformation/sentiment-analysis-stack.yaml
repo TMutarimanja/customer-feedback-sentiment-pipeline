@@ -1,0 +1,368 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Customer Feedback Sentiment Analysis System - CloudFormation Template'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  S3BucketName:
+    Type: String
+    Default: customer-feedback-sentiment-analysis
+    Description: S3 bucket name for storing customer feedback files
+  
+  NotificationEmail:
+    Type: String
+    Default: alerts@example.com
+    Description: Email address for notifications
+  
+  NegativeSentimentThreshold:
+    Type: Number
+    Default: 0.3
+    MinValue: 0.0
+    MaxValue: 1.0
+    Description: Threshold for negative sentiment alerts
+
+Globals:
+  Function:
+    Timeout: 300
+    Runtime: python3.12
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        DYNAMODB_TABLE: !Ref SentimentAnalysisTable
+        DYNAMODB_ALERTS_TABLE: !Ref AlertsTable
+        S3_BUCKET: !Ref CustomerFeedbackBucket
+        SNS_TOPIC_ARN: !Ref NotificationTopic
+        SES_FROM_EMAIL: !Ref NotificationEmail
+        NEGATIVE_SENTIMENT_THRESHOLD: !Ref NegativeSentimentThreshold
+
+Resources:
+  # S3 Bucket for customer feedback files
+  CustomerFeedbackBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${S3BucketName}-${Environment}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt SentimentProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+                  - Name: suffix
+                    Value: .json
+                  - Name: suffix
+                    Value: .txt
+
+  # DynamoDB table for sentiment analysis results
+  SentimentAnalysisTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "sentiment-analysis-results-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: object_key
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ObjectKeyIndex
+          KeySchema:
+            - AttributeName: object_key
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # DynamoDB table for alerts
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "sentiment-alerts-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: alert_type
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: AlertTypeIndex
+          KeySchema:
+            - AttributeName: alert_type
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # SNS Topic for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "sentiment-analysis-notifications-${Environment}"
+      DisplayName: Sentiment Analysis Notifications
+
+  # SNS Subscription
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Lambda function for sentiment processing
+  SentimentProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "sentiment-processor-${Environment}"
+      CodeUri: ../../lambda/sentiment-processor/
+      Handler: lambda_function.lambda_handler
+      Description: Process customer feedback files and perform sentiment analysis
+      MemorySize: 512
+      # ReservedConcurrencyLimit: 10  # Removed for SAM compatibility
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref CustomerFeedbackBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SentimentAnalysisTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AlertsTable
+        - ComprehendReadOnlyPolicy
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+      Events:
+        S3Event:
+          Type: S3
+          Properties:
+            Bucket: !Ref CustomerFeedbackBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+                  - Name: suffix
+                    Value: .json
+                  - Name: suffix
+                    Value: .txt
+
+  # Lambda function for API handling
+  ApiHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "sentiment-api-handler-${Environment}"
+      CodeUri: ../../lambda/api-handler/
+      Handler: lambda_function.lambda_handler
+      Description: Handle API requests for sentiment analysis system
+      MemorySize: 256
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref SentimentAnalysisTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref AlertsTable
+        - S3ReadPolicy:
+            BucketName: !Ref CustomerFeedbackBucket
+
+  # Lambda function for alert handling
+  AlertHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "sentiment-alert-handler-${Environment}"
+      CodeUri: ../../lambda/alert-handler/
+      Handler: lambda_function.lambda_handler
+      Description: Handle alerts and notifications
+      MemorySize: 256
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AlertsTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+        - SESCrudPolicy
+
+  # API Gateway
+  SentimentAnalysisApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "sentiment-analysis-api-${Environment}"
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      DefinitionBody:
+        openapi: 3.0.1
+        info:
+          title: Sentiment Analysis API
+          version: 1.0.0
+        paths:
+          /sentiment/results:
+            get:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiHandlerFunction.Arn}/invocations"
+          /sentiment/summary:
+            get:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiHandlerFunction.Arn}/invocations"
+          /sentiment/files:
+            get:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiHandlerFunction.Arn}/invocations"
+          /sentiment/results/{id}:
+            get:
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiHandlerFunction.Arn}/invocations"
+
+  # Lambda permissions for API Gateway
+  ApiHandlerFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "${SentimentAnalysisApi}/*/*"
+
+  # CloudWatch Log Groups
+  SentimentProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/sentiment-processor-${Environment}"
+      RetentionInDays: 14
+
+  ApiHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/sentiment-api-handler-${Environment}"
+      RetentionInDays: 14
+
+  AlertHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/sentiment-alert-handler-${Environment}"
+      RetentionInDays: 14
+
+  # CloudWatch Alarms
+  SentimentProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "sentiment-processor-errors-${Environment}"
+      AlarmDescription: Alert when sentiment processor has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SentimentProcessorFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  # IAM Role for QuickSight
+  QuickSightRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "quicksight-sentiment-analysis-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: quicksight.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: QuickSightAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeTable
+                  - dynamodb:ListTables
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt SentimentAnalysisTable.Arn
+                  - !GetAtt CustomerFeedbackBucket.Arn
+                  - !Sub "${CustomerFeedbackBucket}/*"
+
+Outputs:
+  CustomerFeedbackBucketName:
+    Description: S3 bucket name for customer feedback files
+    Value: !Ref CustomerFeedbackBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CustomerFeedbackBucket"
+
+  SentimentAnalysisTableName:
+    Description: DynamoDB table name for sentiment analysis results
+    Value: !Ref SentimentAnalysisTable
+    Export:
+      Name: !Sub "${AWS::StackName}-SentimentAnalysisTable"
+
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${SentimentAnalysisApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiGatewayUrl"
+
+  NotificationTopicArn:
+    Description: SNS topic ARN for notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-NotificationTopic"
+
+  QuickSightRoleArn:
+    Description: IAM role ARN for QuickSight access
+    Value: !GetAtt QuickSightRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-QuickSightRole"

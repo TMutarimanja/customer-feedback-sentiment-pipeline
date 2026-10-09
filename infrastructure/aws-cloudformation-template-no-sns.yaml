@@ -1,0 +1,1025 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Customer Feedback Sentiment Analysis System - Without SNS Subscription'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name (dev, staging, prod)
+  
+  S3BucketName:
+    Type: String
+    Default: customer-feedback-sentiment-analysis
+    Description: Base name for S3 bucket (will be suffixed with environment and account ID)
+  
+  NotificationEmail:
+    Type: String
+    Default: alerts@example.com
+    Description: Email address for SNS notifications (will be configured manually)
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+  
+  NegativeSentimentThreshold:
+    Type: Number
+    Default: 0.3
+    MinValue: 0.0
+    MaxValue: 1.0
+    Description: Threshold for negative sentiment alerts (0.0 to 1.0)
+
+Resources:
+  # S3 Bucket for customer feedback files
+  CustomerFeedbackBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${S3BucketName}-${Environment}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+
+  # DynamoDB table for sentiment analysis results
+  SentimentAnalysisTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "sentiment-analysis-results-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: object_key
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ObjectKeyIndex
+          KeySchema:
+            - AttributeName: object_key
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # DynamoDB table for alerts
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "sentiment-alerts-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: alert_type
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: AlertTypeIndex
+          KeySchema:
+            - AttributeName: alert_type
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # SNS Topic for notifications (without subscription to avoid confirmation issues)
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "sentiment-analysis-notifications-${Environment}"
+      DisplayName: !Sub "Sentiment Analysis Notifications - ${Environment}"
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "sentiment-analysis-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SentimentAnalysisPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "arn:aws:s3:::${CustomerFeedbackBucket}"
+                  - !Sub "arn:aws:s3:::${CustomerFeedbackBucket}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: 
+                  - !GetAtt SentimentAnalysisTable.Arn
+                  - !GetAtt AlertsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  # Lambda function for sentiment processing
+  SentimentProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "sentiment-processor-${Environment}"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          DYNAMODB_TABLE: !Ref SentimentAnalysisTable
+          DYNAMODB_ALERTS_TABLE: !Ref AlertsTable
+          S3_BUCKET: !Ref CustomerFeedbackBucket
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          NEGATIVE_SENTIMENT_THRESHOLD: !Ref NegativeSentimentThreshold
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timezone, timedelta
+          from decimal import Decimal
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          s3_client = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+          sns_client = boto3.client('sns')
+          
+          # Environment variables
+          DYNAMODB_TABLE = os.environ['DYNAMODB_TABLE']
+          DYNAMODB_ALERTS_TABLE = os.environ['DYNAMODB_ALERTS_TABLE']
+          S3_BUCKET = os.environ['S3_BUCKET']
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          NEGATIVE_SENTIMENT_THRESHOLD = float(os.environ['NEGATIVE_SENTIMENT_THRESHOLD'])
+          
+          # New York timezone
+          NY_TZ = timezone(timedelta(hours=-5))
+          
+          def lambda_handler(event, context):
+              """
+              Lambda handler for processing S3 events and performing sentiment analysis
+              """
+              try:
+                  logger.info(f"Processing event: {json.dumps(event)}")
+                  
+                  # Process S3 events
+                  for record in event.get('Records', []):
+                      if record.get('eventSource') == 'aws:s3':
+                          bucket = record['s3']['bucket']['name']
+                          key = record['s3']['object']['key']
+                          
+                          logger.info(f"Processing file: s3://{bucket}/{key}")
+                          
+                          # Download and process file
+                          file_content = download_file_from_s3(bucket, key)
+                          results = process_file_content(file_content, key)
+                          
+                          # Store results in DynamoDB
+                          for result in results:
+                              store_result(result)
+                              
+                          logger.info(f"Processed {len(results)} feedback items from {key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'File processing completed successfully',
+                          'processed_files': len(event.get('Records', []))
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing event: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': str(e)
+                      })
+                  }
+          
+          def download_file_from_s3(bucket, key):
+              """Download file content from S3"""
+              try:
+                  response = s3_client.get_object(Bucket=bucket, Key=key)
+                  return response['Body'].read().decode('utf-8')
+              except Exception as e:
+                  logger.error(f"Error downloading file from S3: {str(e)}")
+                  raise
+          
+          def process_file_content(content, object_key):
+              """Process file content and extract feedback items"""
+              results = []
+              
+              try:
+                  # Try to parse as JSON first
+                  if object_key.endswith('.json'):
+                      data = json.loads(content)
+                      if isinstance(data, list):
+                          for item in data:
+                              if isinstance(item, dict) and 'text' in item:
+                                  results.append(process_feedback_item(item, object_key))
+                      elif isinstance(data, dict) and 'text' in data:
+                          results.append(process_feedback_item(data, object_key))
+                  
+                  # Try to parse as CSV
+                  elif object_key.endswith('.csv'):
+                      lines = content.strip().split('\n')
+                      if len(lines) > 1:  # Has header
+                          headers = [h.strip().lower() for h in lines[0].split(',')]
+                          for line in lines[1:]:
+                              values = [v.strip().strip('"') for v in line.split(',')]
+                              if len(values) >= len(headers):
+                                  item = dict(zip(headers, values))
+                                  if 'text' in item or 'feedback' in item:
+                                      text = item.get('text') or item.get('feedback')
+                                      results.append(process_feedback_item({'text': text, **item}, object_key))
+                  
+                  # Process as plain text
+                  else:
+                      lines = content.strip().split('\n')
+                      for i, line in enumerate(lines):
+                          if line.strip():
+                              results.append(process_feedback_item({
+                                  'text': line.strip(),
+                                  'line_number': i + 1
+                              }, object_key))
+              
+              except Exception as e:
+                  logger.error(f"Error processing file content: {str(e)}")
+                  # Create a fallback result
+                  results.append(process_feedback_item({
+                      'text': content[:500] + '...' if len(content) > 500 else content,
+                      'error': str(e)
+                  }, object_key))
+              
+              return results
+          
+          def process_feedback_item(item, object_key):
+              """Process individual feedback item and perform sentiment analysis"""
+              text = item.get('text', '').strip()
+              if not text:
+                  return None
+              
+              # Perform sentiment analysis
+              sentiment_result = analyze_sentiment_simple(text)
+              
+              # Generate unique ID
+              import hashlib
+              import time
+              unique_id = f"{object_key}_{int(time.time())}_{hashlib.md5(text.encode()).hexdigest()[:8]}"
+              
+              # Create result
+              result = {
+                  'id': unique_id,
+                  'object_key': object_key,
+                  'text': text,
+                  'sentiment': sentiment_result['sentiment'],
+                  'sentiment_score': convert_floats_to_decimals(sentiment_result['confidence']),
+                  'timestamp': datetime.now(NY_TZ).isoformat(),
+                  'metadata': {k: v for k, v in item.items() if k != 'text'},
+                  'ttl': int(time.time()) + (30 * 24 * 60 * 60)  # 30 days TTL
+              }
+              
+              # Check for negative sentiment and send alert
+              if sentiment_result['sentiment'] == 'NEGATIVE' and sentiment_result['confidence']['Negative'] > NEGATIVE_SENTIMENT_THRESHOLD:
+                  send_negative_sentiment_alert(result)
+              
+              return result
+          
+          def analyze_sentiment_simple(text):
+              """Simple rule-based sentiment analysis"""
+              positive_words = [
+                  'good', 'great', 'excellent', 'amazing', 'wonderful', 'fantastic',
+                  'awesome', 'love', 'like', 'best', 'perfect', 'outstanding',
+                  'brilliant', 'superb', 'delighted', 'pleased', 'satisfied', 'happy',
+                  'impressed', 'recommend', 'helpful', 'easy', 'fast', 'quick',
+                  'reliable', 'professional', 'friendly'
+              ]
+              
+              negative_words = [
+                  'bad', 'terrible', 'awful', 'horrible', 'worst', 'hate', 'dislike',
+                  'disappointed', 'frustrated', 'angry', 'annoyed', 'upset', 'poor',
+                  'slow', 'broken', 'crashed', 'failed', 'error', 'problem', 'issue',
+                  'difficult', 'hard', 'confusing', 'complicated', 'unreliable', 'unhelpful'
+              ]
+              
+              text_lower = text.lower()
+              positive_count = sum(1 for word in positive_words if word in text_lower)
+              negative_count = sum(1 for word in negative_words if word in text_lower)
+              
+              if positive_count > negative_count:
+                  sentiment = 'POSITIVE'
+                  confidence = min(0.9, 0.5 + (positive_count - negative_count) * 0.1)
+              elif negative_count > positive_count:
+                  sentiment = 'NEGATIVE'
+                  confidence = min(0.9, 0.5 + (negative_count - positive_count) * 0.1)
+              else:
+                  sentiment = 'NEUTRAL'
+                  confidence = 0.5
+              
+              return {
+                  'sentiment': sentiment,
+                  'confidence': {
+                      'Positive': confidence if sentiment == 'POSITIVE' else 0.1,
+                      'Negative': confidence if sentiment == 'NEGATIVE' else 0.1,
+                      'Neutral': confidence if sentiment == 'NEUTRAL' else 0.1,
+                      'Mixed': 0.1
+                  }
+              }
+          
+          def convert_floats_to_decimals(obj):
+              """Convert float values to Decimal for DynamoDB compatibility"""
+              if isinstance(obj, dict):
+                  return {k: convert_floats_to_decimals(v) for k, v in obj.items()}
+              elif isinstance(obj, list):
+                  return [convert_floats_to_decimals(item) for item in obj]
+              elif isinstance(obj, float):
+                  return Decimal(str(obj))
+              else:
+                  return obj
+          
+          def store_result(result):
+              """Store result in DynamoDB"""
+              try:
+                  table = dynamodb.Table(DYNAMODB_TABLE)
+                  table.put_item(Item=result)
+                  logger.info(f"Stored result: {result['id']}")
+              except Exception as e:
+                  logger.error(f"Error storing result: {str(e)}")
+                  raise
+          
+          def send_negative_sentiment_alert(result):
+              """Send alert for negative sentiment"""
+              try:
+                  message = {
+                      'alert_type': 'negative_sentiment',
+                      'message': 'High negative sentiment detected in customer feedback',
+                      'details': {
+                          'sentiment_score': float(result['sentiment_score']['Negative']),
+                          'file_id': result['object_key'],
+                          'threshold': NEGATIVE_SENTIMENT_THRESHOLD,
+                          'text_preview': result['text'][:100] + '...' if len(result['text']) > 100 else result['text'],
+                          'timestamp': result['timestamp']
+                      }
+                  }
+                  
+                  sns_client.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Message=json.dumps(message),
+                      Subject='🚨 Sentiment Analysis Alert - Negative Feedback Detected'
+                  )
+                  
+                  logger.info(f"Sent negative sentiment alert for: {result['id']}")
+                  
+              except Exception as e:
+                  logger.error(f"Error sending alert: {str(e)}")
+
+  # Lambda function for API handling
+  ApiHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "sentiment-api-handler-${Environment}"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          DYNAMODB_TABLE: !Ref SentimentAnalysisTable
+          DYNAMODB_ALERTS_TABLE: !Ref AlertsTable
+          S3_BUCKET: !Ref CustomerFeedbackBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timezone, timedelta
+          from decimal import Decimal
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          
+          # Environment variables
+          DYNAMODB_TABLE = os.environ['DYNAMODB_TABLE']
+          DYNAMODB_ALERTS_TABLE = os.environ['DYNAMODB_ALERTS_TABLE']
+          S3_BUCKET = os.environ['S3_BUCKET']
+          
+          # New York timezone
+          NY_TZ = timezone(timedelta(hours=-5))
+          
+          def lambda_handler(event, context):
+              """
+              Lambda handler for API Gateway requests
+              """
+              try:
+                  logger.info(f"API request: {json.dumps(event)}")
+                  
+                  # Extract HTTP method and path
+                  http_method = event.get('httpMethod', 'GET')
+                  path = event.get('path', '/')
+                  
+                  # Route requests
+                  if http_method == 'GET':
+                      if path == '/sentiment/summary':
+                          return handle_get_summary()
+                      elif path == '/sentiment/results':
+                          return handle_get_results(event)
+                      elif path.startswith('/sentiment/results/'):
+                          return handle_get_single_result(event)
+                      else:
+                          return create_response(404, {'error': 'Endpoint not found'})
+                  
+                  elif http_method == 'POST':
+                      if path == '/sentiment':
+                          return handle_post_sentiment(event)
+                      else:
+                          return create_response(404, {'error': 'Endpoint not found'})
+                  
+                  else:
+                      return create_response(405, {'error': 'Method not allowed'})
+                      
+              except Exception as e:
+                  logger.error(f"API handler error: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'})
+          
+          def create_response(status_code, body, cors_headers=True):
+              """Create HTTP response with CORS headers"""
+              response = {
+                  'statusCode': status_code,
+                  'body': json.dumps(body, default=convert_decimals_to_floats)
+              }
+              
+              if cors_headers:
+                  response['headers'] = {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+                      'Content-Type': 'application/json'
+                  }
+              
+              return response
+          
+          def convert_decimals_to_floats(obj):
+              """Convert Decimal values back to float for JSON serialization"""
+              if isinstance(obj, dict):
+                  return {k: convert_decimals_to_floats(v) for k, v in obj.items()}
+              elif isinstance(obj, list):
+                  return [convert_decimals_to_floats(item) for item in obj]
+              elif isinstance(obj, Decimal):
+                  return float(obj)
+              else:
+                  return obj
+          
+          def handle_get_summary():
+              """Get sentiment analysis summary"""
+              try:
+                  table = dynamodb.Table(DYNAMODB_TABLE)
+                  
+                  # Scan all items
+                  response = table.scan()
+                  items = response.get('Items', [])
+                  
+                  # Calculate summary
+                  total_items = len(items)
+                  positive_count = sum(1 for item in items if item.get('sentiment') == 'POSITIVE')
+                  negative_count = sum(1 for item in items if item.get('sentiment') == 'NEGATIVE')
+                  neutral_count = sum(1 for item in items if item.get('sentiment') == 'NEUTRAL')
+                  
+                  # Get unique files
+                  unique_files = set(item.get('object_key', 'unknown') for item in items)
+                  
+                  summary = {
+                      'total_items': total_items,
+                      'total_files': len(unique_files),
+                      'positive_sentiment': positive_count,
+                      'negative_sentiment': negative_count,
+                      'neutral_sentiment': neutral_count,
+                      'positive_percentage': round((positive_count / total_items * 100) if total_items > 0 else 0, 1),
+                      'negative_percentage': round((negative_count / total_items * 100) if total_items > 0 else 0, 1),
+                      'neutral_percentage': round((neutral_count / total_items * 100) if total_items > 0 else 0, 1),
+                      'last_updated': datetime.now(NY_TZ).isoformat()
+                  }
+                  
+                  return create_response(200, summary)
+                  
+              except Exception as e:
+                  logger.error(f"Error getting summary: {str(e)}")
+                  return create_response(500, {'error': 'Failed to get summary'})
+          
+          def handle_get_results(event):
+              """Get sentiment analysis results with filtering"""
+              try:
+                  table = dynamodb.Table(DYNAMODB_TABLE)
+                  
+                  # Get query parameters
+                  query_params = event.get('queryStringParameters') or {}
+                  limit = int(query_params.get('limit', 50))
+                  sentiment_filter = query_params.get('sentiment')
+                  
+                  # Scan items
+                  response = table.scan()
+                  items = response.get('Items', [])
+                  
+                  # Apply sentiment filter
+                  if sentiment_filter:
+                      items = [item for item in items if item.get('sentiment') == sentiment_filter.upper()]
+                  
+                  # Sort by timestamp (latest first)
+                  items.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
+                  
+                  # Limit results
+                  items = items[:limit]
+                  
+                  return create_response(200, {
+                      'results': items,
+                      'count': len(items),
+                      'total_available': len(response.get('Items', []))
+                  })
+                  
+              except Exception as e:
+                  logger.error(f"Error getting results: {str(e)}")
+                  return create_response(500, {'error': 'Failed to get results'})
+          
+          def handle_get_single_result(event):
+              """Get single sentiment analysis result by ID"""
+              try:
+                  # Extract ID from path
+                  path_parts = event.get('path', '').split('/')
+                  result_id = path_parts[-1] if path_parts else None
+                  
+                  if not result_id:
+                      return create_response(400, {'error': 'Result ID required'})
+                  
+                  table = dynamodb.Table(DYNAMODB_TABLE)
+                  response = table.get_item(Key={'id': result_id})
+                  
+                  if 'Item' not in response:
+                      return create_response(404, {'error': 'Result not found'})
+                  
+                  return create_response(200, response['Item'])
+                  
+              except Exception as e:
+                  logger.error(f"Error getting single result: {str(e)}")
+                  return create_response(500, {'error': 'Failed to get result'})
+          
+          def handle_post_sentiment(event):
+              """Handle POST requests for sentiment analysis"""
+              try:
+                  # Parse request body
+                  body = json.loads(event.get('body', '{}'))
+                  
+                  # Check if it's a text feedback or file upload
+                  if 'text' in body:
+                      return handle_text_feedback(body)
+                  else:
+                      return create_response(400, {'error': 'Invalid request format'})
+                      
+              except json.JSONDecodeError:
+                  return create_response(400, {'error': 'Invalid JSON in request body'})
+              except Exception as e:
+                  logger.error(f"Error handling POST request: {str(e)}")
+                  return create_response(500, {'error': 'Internal server error'})
+          
+          def handle_text_feedback(data):
+              """Handle single text feedback submission"""
+              try:
+                  text = data.get('text', '').strip()
+                  if not text or len(text) < 10:
+                      return create_response(400, {'error': 'Text must be at least 10 characters long'})
+                  
+                  if len(text) > 5000:
+                      return create_response(400, {'error': 'Text must be less than 5000 characters'})
+                  
+                  # Validate rating if provided
+                  rating = data.get('rating')
+                  if rating is not None:
+                      try:
+                          rating = int(rating)
+                          if rating < 1 or rating > 5:
+                              return create_response(400, {'error': 'Rating must be between 1 and 5'})
+                      except (ValueError, TypeError):
+                          return create_response(400, {'error': 'Rating must be an integer between 1 and 5'})
+                  
+                  # Perform sentiment analysis
+                  sentiment_result = analyze_sentiment_simple(text)
+                  
+                  # Generate unique ID
+                  import hashlib
+                  import time
+                  unique_id = f"text_feedback_{int(time.time())}_{hashlib.md5(text.encode()).hexdigest()[:8]}"
+                  
+                  # Create result
+                  result = {
+                      'id': unique_id,
+                      'object_key': 'text_feedback',
+                      'text': text,
+                      'sentiment': sentiment_result['sentiment'],
+                      'sentiment_score': convert_floats_to_decimals(sentiment_result['confidence']),
+                      'timestamp': datetime.now(NY_TZ).isoformat(),
+                      'metadata': {
+                          'rating': rating,
+                          'customer_info': data.get('customer_info', {}),
+                          'source': 'single_feedback',
+                          'submitted_at': datetime.now(NY_TZ).isoformat()
+                      },
+                      'ttl': int(time.time()) + (30 * 24 * 60 * 60)  # 30 days TTL
+                  }
+                  
+                  # Store in DynamoDB
+                  table = dynamodb.Table(DYNAMODB_TABLE)
+                  table.put_item(Item=result)
+                  
+                  # Return response
+                  response_data = {
+                      'message': 'Feedback submitted successfully',
+                      'feedback_id': unique_id,
+                      'sentiment': sentiment_result['sentiment'],
+                      'confidence': sentiment_result['confidence'],
+                      'rating': rating,
+                      'timestamp': result['timestamp']
+                  }
+                  
+                  return create_response(200, response_data)
+                  
+              except Exception as e:
+                  logger.error(f"Error handling text feedback: {str(e)}")
+                  return create_response(500, {'error': 'Failed to process feedback'})
+          
+          def analyze_sentiment_simple(text):
+              """Simple rule-based sentiment analysis (same as processor)"""
+              positive_words = [
+                  'good', 'great', 'excellent', 'amazing', 'wonderful', 'fantastic',
+                  'awesome', 'love', 'like', 'best', 'perfect', 'outstanding',
+                  'brilliant', 'superb', 'delighted', 'pleased', 'satisfied', 'happy',
+                  'impressed', 'recommend', 'helpful', 'easy', 'fast', 'quick',
+                  'reliable', 'professional', 'friendly'
+              ]
+              
+              negative_words = [
+                  'bad', 'terrible', 'awful', 'horrible', 'worst', 'hate', 'dislike',
+                  'disappointed', 'frustrated', 'angry', 'annoyed', 'upset', 'poor',
+                  'slow', 'broken', 'crashed', 'failed', 'error', 'problem', 'issue',
+                  'difficult', 'hard', 'confusing', 'complicated', 'unreliable', 'unhelpful'
+              ]
+              
+              text_lower = text.lower()
+              positive_count = sum(1 for word in positive_words if word in text_lower)
+              negative_count = sum(1 for word in negative_words if word in text_lower)
+              
+              if positive_count > negative_count:
+                  sentiment = 'POSITIVE'
+                  confidence = min(0.9, 0.5 + (positive_count - negative_count) * 0.1)
+              elif negative_count > positive_count:
+                  sentiment = 'NEGATIVE'
+                  confidence = min(0.9, 0.5 + (negative_count - positive_count) * 0.1)
+              else:
+                  sentiment = 'NEUTRAL'
+                  confidence = 0.5
+              
+              return {
+                  'sentiment': sentiment,
+                  'confidence': {
+                      'Positive': confidence if sentiment == 'POSITIVE' else 0.1,
+                      'Negative': confidence if sentiment == 'NEGATIVE' else 0.1,
+                      'Neutral': confidence if sentiment == 'NEUTRAL' else 0.1,
+                      'Mixed': 0.1
+                  }
+              }
+
+  # Lambda function for alert handling
+  AlertHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "sentiment-alert-handler-${Environment}"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          DYNAMODB_TABLE: !Ref SentimentAnalysisTable
+          DYNAMODB_ALERTS_TABLE: !Ref AlertsTable
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          NEGATIVE_SENTIMENT_THRESHOLD: !Ref NegativeSentimentThreshold
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          import os
+          from datetime import datetime, timezone, timedelta
+          from decimal import Decimal
+          
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          # Initialize AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          sns_client = boto3.client('sns')
+          
+          # Environment variables
+          DYNAMODB_TABLE = os.environ['DYNAMODB_TABLE']
+          DYNAMODB_ALERTS_TABLE = os.environ['DYNAMODB_ALERTS_TABLE']
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          NEGATIVE_SENTIMENT_THRESHOLD = float(os.environ['NEGATIVE_SENTIMENT_THRESHOLD'])
+          
+          # New York timezone
+          NY_TZ = timezone(timedelta(hours=-5))
+          
+          def lambda_handler(event, context):
+              """
+              Lambda handler for processing alerts
+              """
+              try:
+                  logger.info(f"Alert handler event: {json.dumps(event)}")
+                  
+                  # Process different types of alerts
+                  if 'alert_type' in event:
+                      return process_alert(event)
+                  else:
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': 'Alert handler function is ready',
+                              'timestamp': datetime.now(NY_TZ).isoformat()
+                          })
+                      }
+                      
+              except Exception as e:
+                  logger.error(f"Alert handler error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Internal server error',
+                          'message': str(e)
+                      })
+                  }
+          
+          def process_alert(alert_data):
+              """Process and store alert"""
+              try:
+                  alert_type = alert_data.get('alert_type')
+                  message = alert_data.get('message', 'Alert triggered')
+                  details = alert_data.get('details', {})
+                  
+                  # Generate unique alert ID
+                  import hashlib
+                  import time
+                  alert_id = f"{alert_type}_{datetime.now(NY_TZ).strftime('%Y-%m-%dT%H:%M:%S.%f')}"
+                  
+                  # Create alert record
+                  alert_record = {
+                      'id': alert_id,
+                      'alert_type': alert_type,
+                      'message': message,
+                      'details': details,
+                      'timestamp': datetime.now(NY_TZ).isoformat(),
+                      'status': 'active',
+                      'ttl': int(time.time()) + (7 * 24 * 60 * 60)  # 7 days TTL
+                  }
+                  
+                  # Store alert in DynamoDB
+                  table = dynamodb.Table(DYNAMODB_ALERTS_TABLE)
+                  table.put_item(Item=alert_record)
+                  
+                  # Send SNS notification
+                  sns_message = {
+                      'alert_id': alert_id,
+                      'alert_type': alert_type,
+                      'message': message,
+                      'details': details,
+                      'timestamp': alert_record['timestamp']
+                  }
+                  
+                  sns_client.publish(
+                      TopicArn=SNS_TOPIC_ARN,
+                      Message=json.dumps(sns_message),
+                      Subject=f'🚨 Sentiment Analysis Alert - {alert_type.replace("_", " ").title()}'
+                  )
+                  
+                  logger.info(f"Processed alert: {alert_id}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Alert processed successfully',
+                          'alert_id': alert_id,
+                          'timestamp': alert_record['timestamp']
+                      })
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing alert: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': 'Failed to process alert',
+                          'message': str(e)
+                      })
+                  }
+
+  # API Gateway
+  SentimentAnalysisApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "sentiment-analysis-api-${Environment}"
+      Description: !Sub "Customer Feedback Sentiment Analysis API - ${Environment}"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource
+  SentimentResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SentimentAnalysisApi
+      ParentId: !GetAtt SentimentAnalysisApi.RootResourceId
+      PathPart: sentiment
+
+  # API Gateway Methods
+  SentimentGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SentimentAnalysisApi
+      ResourceId: !Ref SentimentResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiHandlerFunction.Arn}/invocations"
+
+  SentimentPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SentimentAnalysisApi
+      ResourceId: !Ref SentimentResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiHandlerFunction.Arn}/invocations"
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: 
+      - SentimentGetMethod
+      - SentimentPostMethod
+    Properties:
+      RestApiId: !Ref SentimentAnalysisApi
+      StageName: !Ref Environment
+
+  # Lambda permissions for API Gateway
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/${SentimentAnalysisApi}/*/*"
+
+  # S3 Event Notification for Lambda
+  S3EventNotification:
+    Type: AWS::S3::Bucket
+    Properties:
+      Bucket: !Ref CustomerFeedbackBucket
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt SentimentProcessorFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+                  - Name: suffix
+                    Value: .json
+                  - Name: suffix
+                    Value: .txt
+
+  # Lambda permission for S3 events
+  S3LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SentimentProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${CustomerFeedbackBucket}"
+
+Outputs:
+  CustomerFeedbackBucketName:
+    Description: S3 bucket name for customer feedback files
+    Value: !Ref CustomerFeedbackBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CustomerFeedbackBucket"
+
+  SentimentAnalysisTableName:
+    Description: DynamoDB table name for sentiment analysis results
+    Value: !Ref SentimentAnalysisTable
+    Export:
+      Name: !Sub "${AWS::StackName}-SentimentAnalysisTable"
+
+  AlertsTableName:
+    Description: DynamoDB table name for alerts
+    Value: !Ref AlertsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-AlertsTable"
+
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${SentimentAnalysisApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiGatewayUrl"
+
+  NotificationTopicArn:
+    Description: SNS topic ARN for notifications (configure subscription manually)
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-NotificationTopic"
+
+  SentimentProcessorFunctionName:
+    Description: Lambda function name for sentiment processing
+    Value: !Ref SentimentProcessorFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-SentimentProcessorFunction"
+
+  ApiHandlerFunctionName:
+    Description: Lambda function name for API handling
+    Value: !Ref ApiHandlerFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiHandlerFunction"
+
+  AlertHandlerFunctionName:
+    Description: Lambda function name for alert handling
+    Value: !Ref AlertHandlerFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-AlertHandlerFunction"

@@ -1,0 +1,16 @@
+{
+  "httpMethod": "GET",
+  "path": "/sentiment/results",
+  "queryStringParameters": null,
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "body": null,
+  "isBase64Encoded": false,
+  "requestContext": {
+    "accountId": "123456789012",
+    "apiId": "test-api-id",
+    "stage": "dev",
+    "requestId": "test-request-id"
+  }
+}

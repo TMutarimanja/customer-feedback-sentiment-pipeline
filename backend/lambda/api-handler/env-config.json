@@ -1,0 +1,8 @@
+{
+  "Variables": {
+    "S3_BUCKET": "customer-feedback-sentiment-analysis-dev-123456789012",
+    "DYNAMODB_TABLE": "sentiment-analysis-results-dev",
+    "DYNAMODB_ALERTS_TABLE": "sentiment-alerts-dev",
+    "SNS_TOPIC_ARN": "arn:aws:sns:us-east-1:123456789012:sentiment-analysis-notifications-dev"
+  }
+}

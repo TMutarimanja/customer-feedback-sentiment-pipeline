@@ -1,0 +1,14 @@
+{
+  "Records": [
+    {
+      "s3": {
+        "bucket": {
+          "name": "customer-feedback-sentiment-analysis-clean-dev-123456789012"
+        },
+        "object": {
+          "key": "uploads/upload_1759804735_8e639ef3.txt"
+        }
+      }
+    }
+  ]
+}

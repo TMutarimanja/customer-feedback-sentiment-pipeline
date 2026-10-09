@@ -1,0 +1,318 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Customer Feedback Sentiment Analysis System - SAM Template'
+
+Globals:
+  Function:
+    Timeout: 300
+    Runtime: python3.12
+    Environment:
+      Variables:
+        DYNAMODB_TABLE: !Ref SentimentAnalysisTable
+        DYNAMODB_ALERTS_TABLE: !Ref AlertsTable
+        S3_BUCKET: !Ref CustomerFeedbackBucket
+        SNS_TOPIC_ARN: !Ref NotificationTopic
+        NEGATIVE_SENTIMENT_THRESHOLD: 0.3
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  S3BucketName:
+    Type: String
+    Default: customer-feedback-sentiment-analysis
+    Description: S3 bucket name for storing customer feedback files
+  
+  NotificationEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Email address for notifications
+
+Resources:
+  # S3 Bucket for customer feedback files
+  CustomerFeedbackBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${S3BucketName}-${Environment}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  # EventBridge rule for S3 object created events to invoke the processor Lambda
+  S3ObjectCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "s3-object-created-to-processor-${Environment}"
+      Description: Trigger processor Lambda on S3 object created events
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref CustomerFeedbackBucket
+      Targets:
+        - Arn: !GetAtt SentimentProcessorFunction.Arn
+          Id: SentimentProcessorTarget
+
+  # Permission for EventBridge to invoke the processor Lambda
+  SentimentProcessorFunctionPermissionForEvents:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SentimentProcessorFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt S3ObjectCreatedRule.Arn
+
+  # DynamoDB table for sentiment analysis results
+  SentimentAnalysisTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "sentiment-analysis-results-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: object_key
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ObjectKeyIndex
+          KeySchema:
+            - AttributeName: object_key
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # DynamoDB table for alerts
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "sentiment-alerts-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: alert_type
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: AlertTypeIndex
+          KeySchema:
+            - AttributeName: alert_type
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # SNS Topic for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "sentiment-analysis-notifications-${Environment}"
+      DisplayName: Sentiment Analysis Notifications
+
+  # SNS Subscription
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # Lambda function for sentiment processing
+  SentimentProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../lambda/sentiment-processor/
+      Handler: lambda_function.lambda_handler
+      Description: Process customer feedback files and perform sentiment analysis
+      MemorySize: 512
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref CustomerFeedbackBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SentimentAnalysisTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AlertsTable
+        - ComprehendReadOnlyPolicy
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+
+
+  # Lambda function for API handling
+  ApiHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../lambda/api-handler/
+      Handler: lambda_function.lambda_handler
+      Description: Handle API requests for sentiment analysis system
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref SentimentAnalysisTable
+          DYNAMODB_ALERTS_TABLE: !Ref AlertsTable
+          S3_BUCKET: !Ref CustomerFeedbackBucket
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SentimentAnalysisTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AlertsTable
+        - S3ReadPolicy:
+            BucketName: !Ref CustomerFeedbackBucket
+        - S3WritePolicy:
+            BucketName: !Ref CustomerFeedbackBucket
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+      Events:
+        ApiEvent:
+          Type: Api
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+
+  # Lambda function for alert handling
+  AlertHandlerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../../lambda/alert-handler/
+      Handler: lambda_function.lambda_handler
+      Description: Handle alerts and notifications
+      MemorySize: 256
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AlertsTable
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt NotificationTopic.TopicName
+        - Statement:
+            Effect: Allow
+            Action:
+              - ses:SendEmail
+              - ses:SendRawEmail
+            Resource: '*'
+
+  # API Gateway
+  # Removed explicit API; SAM will create an implicit ServerlessRestApi
+
+  # CloudWatch Log Groups are managed by Lambda by default; explicit resources removed to avoid conflicts
+
+  # CloudWatch Alarms
+  SentimentProcessorErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "sentiment-processor-errors-${Environment}"
+      AlarmDescription: Alert when sentiment processor has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SentimentProcessorFunction
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  # IAM Role for QuickSight (removed due to ARN issues)
+  # QuickSightRole:
+  #   Type: AWS::IAM::Role
+  #   Properties:
+  #     RoleName: !Sub "quicksight-sentiment-analysis-${Environment}"
+  #     AssumeRolePolicyDocument:
+  #       Version: '2012-10-17'
+  #       Statement:
+  #         - Effect: Allow
+  #           Principal:
+  #             Service: quicksight.amazonaws.com
+  #           Action: sts:AssumeRole
+  #     Policies:
+  #       - PolicyName: QuickSightAccess
+  #         PolicyDocument:
+  #           Version: '2012-10-17'
+  #           Statement:
+  #             - Effect: Allow
+  #               Action:
+  #                 - dynamodb:DescribeTable
+  #                 - dynamodb:ListTables
+  #                 - dynamodb:Scan
+  #                 - dynamodb:Query
+  #                 - s3:GetObject
+  #                 - s3:ListBucket
+  #               Resource:
+  #                 - !GetAtt SentimentAnalysisTable.Arn
+  #                 - !Sub "arn:aws:s3:::${CustomerFeedbackBucket}"
+  #                 - !Sub "arn:aws:s3:::${CustomerFeedbackBucket}/*"
+
+  
+
+Outputs:
+  CustomerFeedbackBucketName:
+    Description: S3 bucket name for customer feedback files
+    Value: !Ref CustomerFeedbackBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CustomerFeedbackBucket"
+
+  SentimentAnalysisTableName:
+    Description: DynamoDB table name for sentiment analysis results
+    Value: !Ref SentimentAnalysisTable
+    Export:
+      Name: !Sub "${AWS::StackName}-SentimentAnalysisTable"
+
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiGatewayUrl"
+
+  NotificationTopicArn:
+    Description: SNS topic ARN for notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-NotificationTopic"
+
+  # QuickSightRoleArn:
+  #   Description: IAM role ARN for QuickSight access
+  #   Value: !GetAtt QuickSightRole.Arn
+  #   Export:
+  #     Name: !Sub "${AWS::StackName}-QuickSightRole"

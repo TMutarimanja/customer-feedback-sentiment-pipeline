@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Customer Feedback Sentiment Analysis System - Clean Deployment'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name (dev, staging, prod)
+  
+  S3BucketName:
+    Type: String
+    Default: customer-feedback-sentiment-analysis
+    Description: Base name for S3 bucket (will be suffixed with environment and account ID)
+  
+  NotificationEmail:
+    Type: String
+    Default: alerts@example.com
+    Description: Email address for SNS notifications (will be configured manually)
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+  
+  NegativeSentimentThreshold:
+    Type: Number
+    Default: 0.3
+    MinValue: 0.0
+    MaxValue: 1.0
+    Description: Threshold for negative sentiment alerts (0.0 to 1.0)
+
+Resources:
+  # S3 Bucket for customer feedback files
+  CustomerFeedbackBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${S3BucketName}-${Environment}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # DynamoDB table for sentiment analysis results
+  SentimentAnalysisTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "sentiment-analysis-results-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: object_key
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ObjectKeyIndex
+          KeySchema:
+            - AttributeName: object_key
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # DynamoDB table for alerts
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "sentiment-alerts-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: alert_type
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: AlertTypeIndex
+          KeySchema:
+            - AttributeName: alert_type
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # SNS Topic for notifications (without subscription to avoid confirmation issues)
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "sentiment-analysis-notifications-${Environment}"
+      DisplayName: !Sub "Sentiment Analysis Notifications - ${Environment}"
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "sentiment-analysis-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SentimentAnalysisPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "arn:aws:s3:::${CustomerFeedbackBucket}"
+                  - !Sub "arn:aws:s3:::${CustomerFeedbackBucket}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: 
+                  - !GetAtt SentimentAnalysisTable.Arn
+                  - !GetAtt AlertsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+Outputs:
+  CustomerFeedbackBucketName:
+    Description: S3 bucket name for customer feedback files
+    Value: !Ref CustomerFeedbackBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CustomerFeedbackBucket"
+
+  SentimentAnalysisTableName:
+    Description: DynamoDB table name for sentiment analysis results
+    Value: !Ref SentimentAnalysisTable
+    Export:
+      Name: !Sub "${AWS::StackName}-SentimentAnalysisTable"
+
+  AlertsTableName:
+    Description: DynamoDB table name for alerts
+    Value: !Ref AlertsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-AlertsTable"
+
+  NotificationTopicArn:
+    Description: SNS topic ARN for notifications (configure subscription manually)
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-NotificationTopic"
+
+  LambdaExecutionRoleArn:
+    Description: IAM role ARN for Lambda functions
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaExecutionRole"

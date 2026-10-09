@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Customer Feedback Sentiment Analysis System - Simple CloudFormation Template'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+  
+  S3BucketName:
+    Type: String
+    Default: customer-feedback-sentiment-analysis
+    Description: S3 bucket name for storing customer feedback files
+  
+  NotificationEmail:
+    Type: String
+    Default: alerts@example.com
+    Description: Email address for notifications
+
+Resources:
+  # S3 Bucket for customer feedback files
+  CustomerFeedbackBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${S3BucketName}-${Environment}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # DynamoDB table for sentiment analysis results
+  SentimentAnalysisTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "sentiment-analysis-results-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: object_key
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ObjectKeyIndex
+          KeySchema:
+            - AttributeName: object_key
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # DynamoDB table for alerts
+  AlertsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "sentiment-alerts-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: alert_type
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: AlertTypeIndex
+          KeySchema:
+            - AttributeName: alert_type
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # SNS Topic for notifications
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "sentiment-analysis-notifications-${Environment}"
+      DisplayName: Sentiment Analysis Notifications
+
+  # SNS Subscription
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotificationEmail
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SentimentAnalysisPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub "arn:aws:s3:::${CustomerFeedbackBucket}"
+                  - !Sub "arn:aws:s3:::${CustomerFeedbackBucket}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: 
+                  - !GetAtt SentimentAnalysisTable.Arn
+                  - !GetAtt AlertsTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  # Lambda function for sentiment processing
+  SentimentProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "sentiment-processor-${Environment}"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref SentimentAnalysisTable
+          DYNAMODB_ALERTS_TABLE: !Ref AlertsTable
+          S3_BUCKET: !Ref CustomerFeedbackBucket
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          NEGATIVE_SENTIMENT_THRESHOLD: "0.3"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              logger.info(f"Processing event: {json.dumps(event)}")
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Sentiment processor function deployed successfully',
+                      'event': event
+                  })
+              }
+
+  # Lambda function for API handling
+  ApiHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "sentiment-api-handler-${Environment}"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref SentimentAnalysisTable
+          DYNAMODB_ALERTS_TABLE: !Ref AlertsTable
+          S3_BUCKET: !Ref CustomerFeedbackBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              logger.info(f"API request: {json.dumps(event)}")
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token',
+                      'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+                  },
+                  'body': json.dumps({
+                      'message': 'API handler function deployed successfully',
+                      'event': event
+                  })
+              }
+
+  # Lambda function for alert handling
+  AlertHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "sentiment-alert-handler-${Environment}"
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref SentimentAnalysisTable
+          DYNAMODB_ALERTS_TABLE: !Ref AlertsTable
+          S3_BUCKET: !Ref CustomerFeedbackBucket
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          NEGATIVE_SENTIMENT_THRESHOLD: "0.3"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def lambda_handler(event, context):
+              logger.info(f"Alert handler event: {json.dumps(event)}")
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Alert handler function deployed successfully',
+                      'event': event
+                  })
+              }
+
+  # API Gateway
+  SentimentAnalysisApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "sentiment-analysis-api-${Environment}"
+      Description: Customer Feedback Sentiment Analysis API
+
+  # API Gateway Resource
+  SentimentResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SentimentAnalysisApi
+      ParentId: !GetAtt SentimentAnalysisApi.RootResourceId
+      PathPart: sentiment
+
+  # API Gateway Method
+  SentimentMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SentimentAnalysisApi
+      ResourceId: !Ref SentimentResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiHandlerFunction.Arn}/invocations"
+
+  # Lambda permission for API Gateway
+  ApiGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiHandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/${SentimentAnalysisApi}/*/*"
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: SentimentMethod
+    Properties:
+      RestApiId: !Ref SentimentAnalysisApi
+      StageName: !Ref Environment
+
+Outputs:
+  CustomerFeedbackBucketName:
+    Description: S3 bucket name for customer feedback files
+    Value: !Ref CustomerFeedbackBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CustomerFeedbackBucket"
+
+  SentimentAnalysisTableName:
+    Description: DynamoDB table name for sentiment analysis results
+    Value: !Ref SentimentAnalysisTable
+    Export:
+      Name: !Sub "${AWS::StackName}-SentimentAnalysisTable"
+
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${SentimentAnalysisApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiGatewayUrl"
+
+  NotificationTopicArn:
+    Description: SNS topic ARN for notifications
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-NotificationTopic"

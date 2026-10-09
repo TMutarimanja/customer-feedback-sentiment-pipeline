@@ -1,0 +1,15 @@
+{
+  "alert_type": "negative_sentiment",
+  "message": "High negative sentiment detected in customer feedback",
+  "details": {
+    "sentiment_score": 0.15,
+    "file_id": "test-file-123",
+    "threshold": 0.3,
+    "timestamp": "2024-10-05T14:30:00.000Z",
+    "customer_feedback": "This product is terrible and I hate it!"
+  },
+  "metadata": {
+    "source": "sentiment-processor",
+    "environment": "dev"
+  }
+}
